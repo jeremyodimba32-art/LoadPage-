@@ -1,5 +1,5 @@
 fastapi
 httpx
-uvicorn
-gunicorn 
-bootstrap
+uvicorn[standard]
+gunicorn
+python-multipart
