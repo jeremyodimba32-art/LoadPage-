@@ -24,6 +24,7 @@ import asyncio
 import gzip
 import json
 import os
+import re
 import sys
 import time
 import logging
@@ -68,6 +69,15 @@ TELEGRAM_BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID", "")
 DISCORD_WEBHOOK_URL    = os.getenv("DISCORD_WEBHOOK_URL", "")
 VERIFY_SSL             = os.getenv("VERIFY_SSL", "true").lower() == "true"
+
+# Sécurité : Bouclier inter-serveurs (authentifie les requêtes vers les backends Dedikka)
+BACKEND_SHIELD_KEY = os.getenv("BACKEND_SHIELD_KEY", "").strip()
+
+# Passerelles WhatsApp PyWAGate à surveiller (ping anti-veille Render + failover intelligent)
+env_pywagate = os.getenv("PYWAGATE_URLS", "")
+PYWAGATE_SERVERS: List[str] = [
+    u.strip().rstrip("/") for u in re.split(r"[,;]+", env_pywagate) if u.strip()
+]
 
 # Sécurité : Clé admin OBLIGATOIREMENT via variable d'environnement BALANCER_ADMIN_KEY sur Render.
 # Si absente au démarrage, une clé aléatoire forte est générée et affichée UNE SEULE FOIS dans les logs.
@@ -250,6 +260,35 @@ class BackendServer:
         }
 
 backends: Dict[str, BackendServer] = {url: BackendServer(url) for url in BACKEND_SERVERS}
+
+class PyWAGateServer:
+    def __init__(self, url: str):
+        self.url = url
+        self.is_healthy: bool = True
+        self.active_connections: int = 0
+        self.total_routed_requests: int = 0
+        self.total_retried_requests: int = 0
+        self.last_check_time: Optional[float] = None
+        self.last_latency_ms: Optional[float] = None
+        self.last_status_code: Optional[int] = None
+        self.consecutive_failures: int = 0
+        self.last_error: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "url": self.url,
+            "status": "ONLINE" if self.is_healthy else "OFFLINE",
+            "active_connections": self.active_connections,
+            "total_requests": self.total_routed_requests,
+            "total_retries": self.total_retried_requests,
+            "last_latency": f"{self.last_latency_ms:.1f} ms" if self.last_latency_ms else "N/A",
+            "last_status_code": self.last_status_code,
+            "last_check_ago": f"{int(time.time() - self.last_check_time)}s" if self.last_check_time else "Jamais",
+            "consecutive_failures": self.consecutive_failures,
+            "last_error": self.last_error,
+        }
+
+pywagate_backends: Dict[str, PyWAGateServer] = {url: PyWAGateServer(url) for url in PYWAGATE_SERVERS}
 http_client: Optional[httpx.AsyncClient] = None
 balancer_start_time = time.time()
 last_ping_time: Optional[float] = None
@@ -322,7 +361,10 @@ async def check_backend_health(client: httpx.AsyncClient, backend: BackendServer
     target_url = f"{backend.url}{HEALTH_ENDPOINT}"
     start      = time.time()
     try:
-        response = await client.get(target_url, timeout=PING_TIMEOUT_SECONDS)
+        ping_headers = {}
+        if BACKEND_SHIELD_KEY:
+            ping_headers["X-Backend-Shield"] = BACKEND_SHIELD_KEY
+        response = await client.get(target_url, headers=ping_headers, timeout=PING_TIMEOUT_SECONDS)
         latency  = (time.time() - start) * 1000
         backend.last_check_time  = time.time()
         backend.last_latency_ms  = latency
@@ -352,19 +394,67 @@ async def check_backend_health(client: httpx.AsyncClient, backend: BackendServer
                 f"🚨 *PANNE DEDIKKA* : `{backend.url}` ne répond plus !\nErreur : `{exc}`."
             ))
 
+async def check_pywagate_health(client: httpx.AsyncClient, py_server: PyWAGateServer):
+    target_url = f"{py_server.url}/health"
+    start = time.time()
+    try:
+        response = await client.get(target_url, timeout=PING_TIMEOUT_SECONDS)
+        if response.status_code == 404:
+            response = await client.get(py_server.url, timeout=PING_TIMEOUT_SECONDS)
+        latency = (time.time() - start) * 1000
+        py_server.last_check_time  = time.time()
+        py_server.last_latency_ms  = latency
+        py_server.last_status_code = response.status_code
+
+        # Tout code < 500 prouve que l'instance Render est éveillée et active
+        if response.status_code < 500:
+            if not py_server.is_healthy:
+                asyncio.create_task(send_alert_notification(
+                    f"✅ *RÉTABLISSEMENT PYWAGATE* : Passerelle WhatsApp `{py_server.url}` ONLINE — Latence : {latency:.1f}ms."
+                ))
+            py_server.is_healthy = True
+            py_server.consecutive_failures = 0
+            py_server.last_error = None
+        else:
+            raise Exception(f"HTTP {response.status_code}")
+
+    except Exception as exc:
+        latency = (time.time() - start) * 1000
+        py_server.last_check_time  = time.time()
+        py_server.last_latency_ms  = latency
+        py_server.last_status_code = None
+        py_server.consecutive_failures += 1
+        py_server.last_error = str(exc)
+        if py_server.is_healthy:
+            py_server.is_healthy = False
+            asyncio.create_task(send_alert_notification(
+                f"🚨 *ALERTE PYWAGATE* : Passerelle WhatsApp `{py_server.url}` ne répond plus !\nErreur : `{exc}`."
+            ))
+
 async def execute_cluster_ping() -> dict:
     global last_ping_time, next_ping_time
     last_ping_time = time.time()
     next_ping_time = last_ping_time + PING_INTERVAL_SECONDS
-    logger.info("🛰️ [PING 10 MIN] Ping de santé & anti-veille Render en cours...")
+    logger.info("🛰️ [PING 10 MIN] Ping de santé & anti-veille Render en cours (Dedikka + PyWAGate)...")
+    tasks = []
     async with httpx.AsyncClient(verify=VERIFY_SSL) as client:
-        await asyncio.gather(*[check_backend_health(client, b) for b in backends.values()])
-    online = sum(1 for b in backends.values() if b.is_healthy)
-    logger.info(f"📊 [PING 10 MIN] {online}/{len(backends)} serveurs ONLINE. Prochain ping dans {PING_INTERVAL_SECONDS // 60} min.")
+        for b in backends.values():
+            tasks.append(check_backend_health(client, b))
+        for p in pywagate_backends.values():
+            tasks.append(check_pywagate_health(client, p))
+        await asyncio.gather(*tasks)
+    online_backends = sum(1 for b in backends.values() if b.is_healthy)
+    online_pywagate = sum(1 for p in pywagate_backends.values() if p.is_healthy)
+    logger.info(
+        f"📊 [PING 10 MIN] Dedikka: {online_backends}/{len(backends)} ONLINE | "
+        f"PyWAGate: {online_pywagate}/{len(pywagate_backends)} ONLINE. Prochain ping dans {PING_INTERVAL_SECONDS // 60} min."
+    )
     return {
         "status":              "success",
-        "online_servers":      online,
+        "online_servers":      online_backends,
         "total_servers":       len(backends),
+        "online_pywagate":     online_pywagate,
+        "total_pywagate":      len(pywagate_backends),
         "last_ping_time":      time.strftime("%H:%M:%S", time.localtime(last_ping_time)),
         "next_ping_in_minutes": PING_INTERVAL_SECONDS / 60,
     }
@@ -702,6 +792,25 @@ async def balancer_dashboard(request: Request):
             <td style="padding:14px 18px;">{f'{b.last_latency_ms:.1f} ms' if b.last_latency_ms else '—'}</td>
             <td style="padding:14px 18px;color:#9ca3af;font-size:13px;">{b.last_error or 'Aucune anomalie'}</td></tr>"""
 
+    pywagate_rows = ""
+    for p in pywagate_backends.values():
+        p_badge_color = "#10b981" if p.is_healthy else "#ef4444"
+        p_badge_text  = "ONLINE" if p.is_healthy else "OFFLINE"
+        pywagate_rows += f"""<tr style="border-bottom:1px solid #1f2937;">
+            <td style="padding:14px 18px;font-weight:600;font-family:monospace;">{p.url}</td>
+            <td style="padding:14px 18px;"><span style="background:{p_badge_color};color:#fff;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:700;">{p_badge_text}</span></td>
+            <td style="padding:14px 18px;color:#38bdf8;font-weight:700;">{p.active_connections}</td>
+            <td style="padding:14px 18px;">{p.total_routed_requests} msg</td>
+            <td style="padding:14px 18px;color:#fbbf24;">{p.total_retried_requests}</td>
+            <td style="padding:14px 18px;">{f'{p.last_latency_ms:.1f} ms' if p.last_latency_ms else '—'}</td>
+            <td style="padding:14px 18px;color:#9ca3af;font-size:13px;">{p.last_error or 'Aucune anomalie'}</td></tr>"""
+
+    shield_badge = (
+        '<span style="background:#10b981;color:#fff;padding:4px 10px;border-radius:10px;font-size:11px;font-weight:700;margin-left:8px;">🛡️ BOUCLIER ACTIF</span>'
+        if BACKEND_SHIELD_KEY else
+        '<span style="background:#f59e0b;color:#000;padding:4px 10px;border-radius:10px;font-size:11px;font-weight:700;margin-left:8px;">⚠️ BOUCLIER INACTIF (DEV)</span>'
+    )
+
     uptime_sec      = int(time.time() - balancer_start_time)
     sec_until_next  = max(0, int(next_ping_time - time.time())) if next_ping_time else PING_INTERVAL_SECONDS
     next_ping_disp  = f"{sec_until_next // 60}m {sec_until_next % 60}s"
@@ -771,9 +880,19 @@ async def balancer_dashboard(request: Request):
         </div>
     </div>
 
+    <h2 style="font-size:17px;color:#f3f4f6;margin-top:28px;margin-bottom:10px;display:flex;align-items:center;">
+        Serveurs API Dedikka {shield_badge}
+    </h2>
     <table>
         <thead><tr><th>Serveur</th><th>Statut</th><th>Connexions</th><th>Requêtes</th><th>Auto-Retries</th><th>Latence</th><th>Dernière Alerte</th></tr></thead>
         <tbody>{rows}</tbody>
+    </table>
+    <h2 style="font-size:17px;color:#f3f4f6;margin-top:32px;margin-bottom:10px;display:flex;align-items:center;">
+        💬 Passerelles WhatsApp PyWAGate (Surveillance & Failover)
+    </h2>
+    <table>
+        <thead><tr><th>Passerelle WhatsApp</th><th>Statut</th><th>Envois Actifs</th><th>Messages</th><th>Bascule/Retry</th><th>Latence Ping</th><th>Dernière Alerte</th></tr></thead>
+        <tbody>{pywagate_rows}</tbody>
     </table>
 
     <p style="font-size:11px;color:#334155;margin-top:18px;text-align:right;">
@@ -789,6 +908,7 @@ async def balancer_dashboard(request: Request):
 EXCLUDED_HEADERS = {
     "host",
     "content-length",
+    "x-backend-shield",  # Évite tout spoofing externe, le bouclier est injecté uniquement par ce proxy
     # Ask upstream for an uncompressed body. Some upstream/proxy responses
     # advertise gzip while returning bytes that httpx cannot decode; browsers
     # then surface the body-decoding failure as a generic "Failed to fetch".
@@ -804,6 +924,67 @@ EXCLUDED_HEADERS = {
     "access-control-allow-headers",
     "access-control-expose-headers",
 }
+
+def select_best_pywagate(exclude_urls: Optional[set] = None) -> Optional[PyWAGateServer]:
+    exclude = exclude_urls or set()
+    available = [s for s in pywagate_backends.values() if s.is_healthy and s.url not in exclude]
+    if not available:
+        available = [s for s in pywagate_backends.values() if s.url not in exclude]
+    if not available:
+        return None
+    available.sort(key=lambda s: (s.active_connections, s.total_routed_requests))
+    return available[0]
+
+@app.api_route("/_balancer/whatsapp/send", methods=["POST"], tags=["whatsapp"])
+@app.api_route("/_balancer/pywagate/send", methods=["POST"], tags=["whatsapp"])
+async def pywagate_smart_failover(request: Request):
+    """
+    Passerelle WhatsApp ultra-résiliente avec bascule automatique instantanée.
+    Si le serveur 1 échoue ou est en veille, bascule instantanément sur le serveur 2, 3...
+    """
+    req_start = time.time()
+    if not pywagate_backends:
+        return JSONResponse(status_code=503, content={"error": "Aucun serveur PyWAGate configuré dans PYWAGATE_URLS."})
+
+    body = await request.body()
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in EXCLUDED_HEADERS}
+    headers["accept-encoding"] = "identity"
+
+    attempted_servers = set()
+    last_exc = None
+
+    for attempt in range(len(pywagate_backends)):
+        server = select_best_pywagate(exclude_urls=attempted_servers)
+        if not server:
+            break
+        attempted_servers.add(server.url)
+        target_url = f"{server.url}/api/messages/send"
+        server.active_connections += 1
+        server.total_routed_requests += 1
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0, verify=VERIFY_SSL) as client:
+                res = await client.post(target_url, content=body, headers=headers)
+                if res.status_code in (502, 503, 504) and attempt < len(pywagate_backends) - 1:
+                    server.total_retried_requests += 1
+                    logger.warning(f"⚠️ PyWAGate {server.url} -> HTTP {res.status_code}, bascule sur serveur suivant...")
+                    continue
+
+                server.last_latency_ms = (time.time() - req_start) * 1000
+                server.is_healthy = True
+                return Response(content=res.content, status_code=res.status_code, headers=dict(res.headers))
+
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            last_exc = exc
+            server.total_retried_requests += 1
+            server.is_healthy = False
+            logger.warning(f"⚠️ PyWAGate {server.url} échec ({exc}), bascule sur serveur suivant...")
+            continue
+        finally:
+            server.active_connections = max(0, server.active_connections - 1)
+
+    logger.error("❌ Tous les serveurs PyWAGate ont échoué pour l'envoi WhatsApp.")
+    return JSONResponse(status_code=502, content={"error": f"Toutes les passerelles WhatsApp ont échoué ({last_exc})."})
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def dynamic_proxy(request: Request, path: str):
@@ -841,6 +1022,8 @@ async def dynamic_proxy(request: Request, path: str):
     headers["accept-encoding"] = "identity"
     headers["x-forwarded-for"]   = f"{headers.get('x-forwarded-for', '')}, {client_ip}".strip(", ")
     headers["x-forwarded-proto"] = request.url.scheme
+    if BACKEND_SHIELD_KEY:
+        headers["X-Backend-Shield"] = BACKEND_SHIELD_KEY
 
     body      = await request.body()
     query_str = f"?{request.url.query}" if request.url.query else ""
