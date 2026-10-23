@@ -24,9 +24,13 @@ import asyncio
 import gzip
 import json
 import os
+import sys
 import time
 import logging
 import threading
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -785,6 +789,13 @@ async def balancer_dashboard(request: Request):
 EXCLUDED_HEADERS = {
     "host",
     "content-length",
+    # Ask upstream for an uncompressed body. Some upstream/proxy responses
+    # advertise gzip while returning bytes that httpx cannot decode; browsers
+    # then surface the body-decoding failure as a generic "Failed to fetch".
+    "accept-encoding",
+    # httpx transparently decompresses response.content; forwarding the old
+    # encoding header makes the browser try to decompress the body a second time.
+    "content-encoding",
     "transfer-encoding",
     "connection",
     "access-control-allow-origin",
@@ -827,6 +838,7 @@ async def dynamic_proxy(request: Request, path: str):
 
     # 3. PRÉPARATION HEADERS PROXY
     headers = {k: v for k, v in request.headers.items() if k.lower() not in EXCLUDED_HEADERS}
+    headers["accept-encoding"] = "identity"
     headers["x-forwarded-for"]   = f"{headers.get('x-forwarded-for', '')}, {client_ip}".strip(", ")
     headers["x-forwarded-proto"] = request.url.scheme
 
@@ -852,6 +864,10 @@ async def dynamic_proxy(request: Request, path: str):
         backend.total_routed_requests += 1
 
         try:
+            global http_client
+            if http_client is None:
+                http_client = httpx.AsyncClient(verify=VERIFY_SSL, timeout=PROXY_TIMEOUT_SECONDS)
+
             req = http_client.build_request(
                 method=request.method, url=target_url,
                 headers=headers, content=body, timeout=PROXY_TIMEOUT_SECONDS
